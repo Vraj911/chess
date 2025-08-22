@@ -1,11 +1,75 @@
 .board-container {
   display: flex;
+  flex-direction: column;
   justify-content: center;
   align-items: center;
-  height: 100vh;
+  min-height: 100vh;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  padding: 20px;
+  box-sizing: border-box;
+  width: 100%;
 }
+
+.game-header {
+  text-align: center;
+  margin-bottom: 30px;
+  color: white;
+  font-family: 'Arial', sans-serif;
+  width: 100%;
+}
+
+.game-title {
+  font-size: 2.5rem;
+  font-weight: bold;
+  margin-bottom: 10px;
+  text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.game-subtitle {
+  font-size: 1.1rem;
+  opacity: 0.9;
+  margin-bottom: 20px;
+}
+
+.chess-wrapper {
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(10px);
+  border-radius: 20px;
+  padding: 20px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  max-width: none;
+  min-height: 600px;
+}
+
 html, body {
   margin: 0;
   padding: 0;
   height: 100%;
+  width: 100%;
+  font-family: 'Arial', sans-serif;
+}
+
+@media (max-width: 768px) {
+  .game-title {
+    font-size: 2rem;
+  }
+  
+  .chess-wrapper {
+    padding: 15px;
+    width: 100%;
+    min-height: 500px;
+  }
+}
+
+@media (max-width: 480px) {
+  .chess-wrapper {
+    width: 100%;
+    min-height: 450px;
+    padding: 10px;
+  }
 }
