@@ -1,226 +1,527 @@
 // socket/socketController.js
-const chessService = require('../service/service');
-const User = require('../models/User');
+const { Chess } = require('chess.js');
+const policyManager = require('../policies/policyManager');
+const { logger } = require('../utils/logger');
 const Game = require('../models/Game');
-let players = {};
-let gameRooms = {};
-let currentGame = null;
-function handleConnection(io, socket) {
-  socket.join('default');
-  if (socket.isAuthenticated && socket.user) {
-    if (!players.white) {
-      players.white = socket.id;
-      socket.emit('playerRole', 'w');
-      socket.emit('gameStatus', chessService.getGameStatus());
-      console.log(`White player assigned: ${socket.user.username} (${socket.id})`);
-    } else if (!players.black) {
-      players.black = socket.id;
-      socket.emit('playerRole', 'b');
-      socket.emit('gameStatus', chessService.getGameStatus());
-      console.log(`Black player assigned: ${socket.user.username} (${socket.id})`);
-    } else {
-      socket.emit('spectatorRole');
-      console.log(`Spectator connected: ${socket.user.username} (${socket.id})`);
-    }
-  } else {
-    socket.emit('spectatorRole');
-    console.log('Anonymous spectator connected:', socket.id);
+const User = require('../models/User');
+
+class SocketController {
+  constructor() {
+    this.games = new Map();
+    this.users = new Map();
+    this.waitingPlayers = [];
   }
-  socket.emit('boardState', chessService.getBoardState());
-  socket.emit('gameStatus', chessService.getGameStatus());
-  socket.emit('moveHistory', chessService.getGameHistory());
-  socket.on('move', async (move) => {
-    const color = (socket.id === players.white) ? 'w' :
-                  (socket.id === players.black) ? 'b' : null;
-    if (!color) {
-      socket.emit('error', 'You are not a player in this game');
-      return;
+
+  /**
+   * Handle user connection
+   * @param {Object} socket - Socket instance
+   * @param {Object} user - User object
+   */
+  async handleConnection(socket, user) {
+    try {
+      // Store user connection
+      this.users.set(socket.id, {
+        userId: user._id,
+        username: user.username,
+        rating: user.rating,
+        socketId: socket.id
+      });
+
+      // Update user online status
+      await User.findByIdAndUpdate(user._id, {
+        isOnline: true,
+        lastSeen: new Date()
+      });
+
+      // Check if user can create/join games
+      const canCreateGame = await policyManager.can('user', 'create_game', { user });
+      if (canCreateGame) {
+        socket.emit('canCreateGame', true);
+      }
+
+      logger.info('User connected', {
+        userId: user._id,
+        username: user.username,
+        socketId: socket.id
+      });
+
+      // Emit user info
+      socket.emit('userInfo', {
+        userId: user._id,
+        username: user.username,
+        rating: user.rating
+      });
+
+    } catch (error) {
+      logger.error('Connection handling error', {
+        userId: user?._id,
+        error: error.message
+      });
+      socket.emit('error', { message: 'Connection failed' });
     }
-    if (!chessService.canMove(color)) {
-      socket.emit('error', 'It is not your turn or the game is over');
-      return;
+  }
+
+  /**
+   * Handle user disconnection
+   * @param {Object} socket - Socket instance
+   */
+  async handleDisconnection(socket) {
+    try {
+      const userInfo = this.users.get(socket.id);
+      if (!userInfo) return;
+
+      // Update user online status
+      await User.findByIdAndUpdate(userInfo.userId, {
+        isOnline: false,
+        lastSeen: new Date()
+      });
+
+      // Remove from waiting players
+      this.waitingPlayers = this.waitingPlayers.filter(p => p.socketId !== socket.id);
+
+      // Handle active games
+      for (const [gameId, game] of this.games) {
+        if (game.players.some(p => p.socketId === socket.id)) {
+          await this.handlePlayerDisconnection(gameId, socket.id);
+        }
+      }
+
+      // Clean up
+      this.users.delete(socket.id);
+
+      logger.info('User disconnected', {
+        userId: userInfo.userId,
+        username: userInfo.username,
+        socketId: socket.id
+      });
+
+    } catch (error) {
+      logger.error('Disconnection handling error', {
+        socketId: socket.id,
+        error: error.message
+      });
     }
-    const result = chessService.makeMove(move);
-    if (result) {
-            if (currentGame) {
-        try {
-          await currentGame.addMove({
-            from: move.from,
-            to: move.to,
-            piece: result.piece,
-            color: color,
-            san: result.san
+  }
+
+  /**
+   * Handle new game request
+   * @param {Object} socket - Socket instance
+   * @param {Object} data - Game data
+   */
+  async handleNewGame(socket, data) {
+    try {
+      const userInfo = this.users.get(socket.id);
+      if (!userInfo) {
+        socket.emit('error', { message: 'User not authenticated' });
+        return;
+      }
+
+      // Check if user can create game
+      const canCreate = await policyManager.can('user', 'create_game', { user: userInfo });
+      if (!canCreate) {
+        socket.emit('error', { message: 'Cannot create game' });
+        return;
+      }
+
+      // Create new game
+      const game = new Chess();
+      const gameId = this.generateGameId();
+      
+      const gameData = {
+        id: gameId,
+        fen: game.fen(),
+        status: 'waiting',
+        players: [{
+          userId: userInfo.userId,
+          username: userInfo.username,
+          rating: userInfo.rating,
+          socketId: socket.id,
+          color: 'white'
+        }],
+        spectators: [],
+        moveCount: 0,
+        createdAt: new Date(),
+        timeControl: data.timeControl || null,
+        allowSpectators: data.allowSpectators !== false
+      };
+
+      this.games.set(gameId, gameData);
+      
+      // Add to waiting players
+      this.waitingPlayers.push({
+        userId: userInfo.userId,
+        username: userInfo.username,
+        rating: userInfo.rating,
+        socketId: socket.id,
+        gameId
+      });
+
+      // Join game room
+      socket.join(gameId);
+      
+      // Emit game created
+      socket.emit('gameCreated', {
+        gameId,
+        game: gameData
+      });
+
+      logger.info('New game created', {
+        gameId,
+        creator: userInfo.userId,
+        timeControl: data.timeControl
+      });
+
+    } catch (error) {
+      logger.error('New game error', {
+        socketId: socket.id,
+        error: error.message
+      });
+      socket.emit('error', { message: 'Failed to create game' });
+    }
+  }
+
+  /**
+   * Handle join game request
+   * @param {Object} socket - Socket instance
+   * @param {Object} data - Join data
+   */
+  async handleJoinGame(socket, data) {
+    try {
+      const userInfo = this.users.get(socket.id);
+      if (!userInfo) {
+        socket.emit('error', { message: 'User not authenticated' });
+        return;
+      }
+
+      const game = this.games.get(data.gameId);
+      if (!game) {
+        socket.emit('error', { message: 'Game not found' });
+        return;
+      }
+
+      // Check if user can join game
+      const canJoin = await policyManager.can('game', 'join_game', { 
+        user: userInfo, 
+        game 
+      });
+      
+      if (!canJoin) {
+        socket.emit('error', { message: 'Cannot join this game' });
+        return;
+      }
+
+      // Add player to game
+      game.players.push({
+        userId: userInfo.userId,
+        username: userInfo.username,
+        rating: userInfo.rating,
+        socketId: socket.id,
+        color: 'black'
+      });
+
+      game.status = 'active';
+      game.currentTurn = 'white';
+
+      // Remove from waiting players
+      this.waitingPlayers = this.waitingPlayers.filter(p => p.gameId !== data.gameId);
+
+      // Join game room
+      socket.join(data.gameId);
+
+      // Notify all players
+      socket.to(data.gameId).emit('playerJoined', {
+        player: {
+          userId: userInfo.userId,
+          username: userInfo.username,
+          rating: userInfo.rating,
+          color: 'black'
+        }
+      });
+
+      // Emit game started
+      socket.emit('gameStarted', { game });
+      socket.to(data.gameId).emit('gameStarted', { game });
+
+      logger.info('Player joined game', {
+        gameId: data.gameId,
+        playerId: userInfo.userId,
+        username: userInfo.username
+      });
+
+    } catch (error) {
+      logger.error('Join game error', {
+        socketId: socket.id,
+        gameId: data.gameId,
+        error: error.message
+      });
+      socket.emit('error', { message: 'Failed to join game' });
+    }
+  }
+
+  /**
+   * Handle move request
+   * @param {Object} socket - Socket instance
+   * @param {Object} data - Move data
+   */
+  async handleMove(socket, data) {
+    try {
+      const userInfo = this.users.get(socket.id);
+      if (!userInfo) {
+        socket.emit('error', { message: 'User not authenticated' });
+        return;
+      }
+
+      const game = this.games.get(data.gameId);
+      if (!game) {
+        socket.emit('error', { message: 'Game not found' });
+        return;
+      }
+
+      // Check if user can make move
+      const canMove = await policyManager.can('game', 'make_move', { 
+        user: userInfo, 
+        game, 
+        move: data 
+      });
+      
+      if (!canMove) {
+        socket.emit('error', { message: 'Cannot make this move' });
+        return;
+      }
+
+      // Execute move
+      const chess = new Chess(game.fen);
+      const move = chess.move(data);
+      
+      if (!move) {
+        socket.emit('error', { message: 'Invalid move' });
+        return;
+      }
+
+      // Update game state
+      game.fen = chess.fen();
+      game.moveCount++;
+      game.currentTurn = game.currentTurn === 'white' ? 'black' : 'white';
+      game.lastMove = move;
+
+      // Check game status
+      if (chess.isCheckmate()) {
+        game.status = 'finished';
+        game.winner = game.currentTurn === 'white' ? 'black' : 'white';
+        game.result = 'checkmate';
+      } else if (chess.isDraw()) {
+        game.status = 'finished';
+        game.result = 'draw';
+        game.drawReason = chess.isStalemate() ? 'stalemate' : 'draw';
+      } else if (chess.isCheck()) {
+        game.isCheck = true;
+      }
+
+      // Emit move to all players
+      socket.to(data.gameId).emit('moveMade', {
+        move: data,
+        fen: game.fen,
+        gameStatus: game.status,
+        isCheck: game.isCheck,
+        currentTurn: game.currentTurn
+      });
+
+      // Emit move confirmation
+      socket.emit('moveConfirmed', {
+        move: data,
+        fen: game.fen,
+        gameStatus: game.status
+      });
+
+      logger.info('Move made', {
+        gameId: data.gameId,
+        playerId: userInfo.userId,
+        move: data,
+        gameStatus: game.status
+      });
+
+    } catch (error) {
+      logger.error('Move error', {
+        socketId: socket.id,
+        gameId: data.gameId,
+        error: error.message
+      });
+      socket.emit('error', { message: 'Failed to make move' });
+    }
+  }
+
+  /**
+   * Handle resign request
+   * @param {Object} socket - Socket instance
+   * @param {Object} data - Resign data
+   */
+  async handleResign(socket, data) {
+    try {
+      const userInfo = this.users.get(socket.id);
+      if (!userInfo) {
+        socket.emit('error', { message: 'User not authenticated' });
+        return;
+      }
+
+      const game = this.games.get(data.gameId);
+      if (!game) {
+        socket.emit('error', { message: 'Game not found' });
+        return;
+      }
+
+      // Check if user can resign
+      const canResign = await policyManager.can('game', 'resign_game', { 
+        user: userInfo, 
+        game 
+      });
+      
+      if (!canResign) {
+        socket.emit('error', { message: 'Cannot resign at this time' });
+        return;
+      }
+
+      // Update game status
+      game.status = 'finished';
+      game.resignedBy = userInfo.userId;
+      game.winner = game.players.find(p => p.userId !== userInfo.userId)?.color;
+      game.result = 'resignation';
+
+      // Notify all players
+      socket.to(data.gameId).emit('gameResigned', {
+        resignedBy: userInfo.userId,
+        winner: game.winner
+      });
+
+      // Emit resignation confirmation
+      socket.emit('resignationConfirmed', {
+        gameId: data.gameId,
+        resignedBy: userInfo.userId
+      });
+
+      logger.info('Game resigned', {
+        gameId: data.gameId,
+        resignedBy: userInfo.userId,
+        winner: game.winner
+      });
+
+    } catch (error) {
+      logger.error('Resign error', {
+        socketId: socket.id,
+        gameId: data.gameId,
+        error: error.message
+      });
+      socket.emit('error', { message: 'Failed to resign game' });
+    }
+  }
+
+  /**
+   * Handle player disconnection from active game
+   * @param {string} gameId - Game ID
+   * @param {string} socketId - Socket ID
+   */
+  async handlePlayerDisconnection(gameId, socketId) {
+    try {
+      const game = this.games.get(gameId);
+      if (!game || game.status !== 'active') return;
+
+      const player = game.players.find(p => p.socketId === socketId);
+      if (!player) return;
+
+      // Update game status
+      game.status = 'finished';
+      game.disconnectedBy = player.userId;
+      game.winner = game.players.find(p => p.socketId !== socketId)?.color;
+      game.result = 'disconnection';
+
+      // Notify remaining players
+      const remainingPlayers = game.players.filter(p => p.socketId !== socketId);
+      for (const player of remainingPlayers) {
+        // Emit to specific player if they're still connected
+        const playerSocket = this.getSocketById(player.socketId);
+        if (playerSocket) {
+          playerSocket.emit('playerDisconnected', {
+            gameId,
+            disconnectedPlayer: player.userId,
+            winner: game.winner
           });
-        } catch (err) {
-          console.error('Error saving move to database:', err);
         }
       }
-      io.to('default').emit('move', move);
-      io.to('default').emit('boardState', chessService.getBoardState());
-      io.to('default').emit('gameStatus', chessService.getGameStatus());
-      io.to('default').emit('moveHistory', chessService.getGameHistory());
-      const gameStatus = chessService.getGameStatus();
-      if (gameStatus.isCheck && !gameStatus.isCheckmate) {
-        io.to('default').emit('check', {
-          color: gameStatus.turn,
-          message: `${gameStatus.turn === 'w' ? 'White' : 'Black'} is in check!`
-        });
-      }
-      if (gameStatus.isCheckmate) {
-        io.to('default').emit('checkmate', {
-          winner: gameStatus.winner,
-          message: chessService.getResult()
-        });
-      }
-      if (gameStatus.status === 'finished') {
-        if (currentGame) {
-          try {
-            const result = gameStatus.winner === 'w' ? 'white_win' : 
-                          gameStatus.winner === 'b' ? 'black_win' : 'draw';
-            await currentGame.endGame(
-              result,
-              gameStatus.winner ? (gameStatus.winner === 'w' ? players.white : players.black) : null,
-              gameStatus.drawReason
-            );
-            await updatePlayerStats(gameStatus);
-          } catch (err) {
-            console.error('Error ending game in database:', err);
-          }
-        }
-        io.to('default').emit('gameOver', {
-          result: chessService.getResult(),
-          winner: gameStatus.winner,
-          drawReason: gameStatus.drawReason,
-          finalBoard: chessService.getBoardState(),
-          pgn: chessService.getPgn()
-        });
-      }
-      console.log(`Move made by ${color}: ${move.from} to ${move.to}`);
-    } else {
-      socket.emit('invalidMove', {
-        move: move,
-        message: 'Invalid move. Please try again.'
+
+      logger.info('Player disconnected from game', {
+        gameId,
+        playerId: player.userId,
+        gameStatus: game.status
+      });
+
+    } catch (error) {
+      logger.error('Player disconnection handling error', {
+        gameId,
+        socketId,
+        error: error.message
       });
     }
-  });
-  socket.on('resign', async () => {
-    const color = (socket.id === players.white) ? 'w' :
-                  (socket.id === players.black) ? 'b' : null;
-    if (!color) {
-      socket.emit('error', 'You are not a player in this game');
-      return;
-    }
-    if (chessService.resign(color)) {
-      if (currentGame) {
-        try {
-          const result = color === 'w' ? 'black_win' : 'white_win';
-          await currentGame.endGame(result, color === 'w' ? players.black : players.white, 'resignation');
-                    const gameStatus = chessService.getGameStatus();
-          await updatePlayerStats(gameStatus);
-        } catch (err) {
-          console.error('Error ending game in database:', err);
-        }
-      }
-      io.to('default').emit('gameOver', {
-        result: `${color === 'w' ? 'Black' : 'White'} wins by resignation!`,
-        winner: color === 'w' ? 'b' : 'w',
-        drawReason: 'resignation',
-        finalBoard: chessService.getBoardState(),
-        pgn: chessService.getPgn()
+  }
+
+  /**
+   * Get waiting games
+   * @param {Object} socket - Socket instance
+   */
+  handleGetWaitingGames(socket) {
+    try {
+      const waitingGames = Array.from(this.games.values())
+        .filter(game => game.status === 'waiting')
+        .map(game => ({
+          id: game.id,
+          creator: game.players[0].username,
+          rating: game.players[0].rating,
+          timeControl: game.timeControl,
+          allowSpectators: game.allowSpectators,
+          createdAt: game.createdAt
+        }));
+
+      socket.emit('waitingGames', waitingGames);
+
+    } catch (error) {
+      logger.error('Get waiting games error', {
+        socketId: socket.id,
+        error: error.message
       });
-      io.to('default').emit('gameStatus', chessService.getGameStatus());
-      console.log(`${color === 'w' ? 'White' : 'Black'} resigned`);
+      socket.emit('error', { message: 'Failed to get waiting games' });
     }
-  });
-  socket.on('newGame', async () => {
-    if (players.white && players.black) {
-            if (currentGame && currentGame.status === 'active') {
-        try {
-          await currentGame.endGame('abandoned', null, 'abandoned');
-        } catch (err) {
-          console.error('Error abandoning current game:', err);
-        }
-      }
-      try {
-        const whiteUser = await getUserFromSocketId(players.white);
-        const blackUser = await getUserFromSocketId(players.black);
-        if (whiteUser && blackUser) {
-          currentGame = new Game({
-            whitePlayer: whiteUser._id,
-            blackPlayer: blackUser._id
-          });
-          await currentGame.save();
-          console.log('New game created in database');
-        }
-      } catch (err) {
-        console.error('Error creating new game in database:', err);
-      }
-      const newBoard = chessService.startNewGame();
-      io.to('default').emit('boardState', newBoard);
-      io.to('default').emit('gameStatus', chessService.getGameStatus());
-      io.to('default').emit('moveHistory', chessService.getGameHistory());
-      io.to('default').emit('newGameStarted', {
-        message: 'New game started!',
-        board: newBoard
-      });
-      console.log('New game started');
-    }
-  });
-  socket.on('getValidMoves', (square) => {
-    const validMoves = chessService.getValidMoves(square);
-    socket.emit('validMoves', { square, moves: validMoves });
-  });
-  socket.on('getGameStatus', () => {
-    socket.emit('gameStatus', chessService.getGameStatus());
-  });
-  socket.on('getMoveHistory', () => {
-    socket.emit('moveHistory', chessService.getGameHistory());
-  });
-  socket.on('disconnect', async () => {
-    console.log('User disconnected:', socket.id);
-    if (socket.id === players.white) {
-      delete players.white;
-      console.log('White player disconnected');
-    }
-    if (socket.id === players.black) {
-      delete players.black;
-      console.log('Black player disconnected');
-    }
-    if (!players.white && !players.black) {
-      chessService.startNewGame();
-      currentGame = null;
-      console.log('Game reset due to no players');
-    }
-    io.to('default').emit('playerDisconnected', {
-      message: 'A player has disconnected',
-      remainingPlayers: Object.keys(players).length
-    });
-  });
-  socket.on('reconnect', (playerData) => {
-    if (playerData.color === 'w' && !players.white) {
-      players.white = socket.id;
-      socket.emit('playerRole', 'w');
-      console.log('White player reconnected');
-    } else if (playerData.color === 'b' && !players.black) {
-      players.black = socket.id;
-      socket.emit('playerRole', 'b');
-      console.log('Black player reconnected');
-    }
-  });
-}
-async function getUserFromSocketId(socketId) {
-  try {
-    return null;
-  } catch (error) {
-    console.error('Error getting user from socket ID:', error);
+  }
+
+  /**
+   * Generate unique game ID
+   * @returns {string} Game ID
+   */
+  generateGameId() {
+    return Math.random().toString(36).substr(2, 9);
+  }
+
+  /**
+   * Get socket by ID (placeholder - would need socket.io instance)
+   * @param {string} socketId - Socket ID
+   * @returns {Object|null} Socket instance
+   */
+  getSocketById(socketId) {
+    // This would need access to the socket.io instance
+    // For now, return null as placeholder
     return null;
   }
-}
-async function updatePlayerStats(gameStatus) {
-  try {
-    console.log('Player statistics updated');
-  } catch (error) {
-    console.error('Error updating player statistics:', error);
+
+  /**
+   * Get game statistics
+   * @returns {Object} Game statistics
+   */
+  getStats() {
+    return {
+      totalGames: this.games.size,
+      activeGames: Array.from(this.games.values()).filter(g => g.status === 'active').length,
+      waitingGames: Array.from(this.games.values()).filter(g => g.status === 'waiting').length,
+      totalUsers: this.users.size,
+      waitingPlayers: this.waitingPlayers.length
+    };
   }
 }
-module.exports = { handleConnection };
+
+module.exports = SocketController;

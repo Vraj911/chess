@@ -1,272 +1,269 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
-const User = require('../models/User');
-const { authenticateToken, requireOwnership } = require('../middleware/auth');
+const AuthService = require('../services/authService');
+const ValidationHelper = require('../utils/validation');
+const ResponseHandler = require('../utils/responseHandler');
+const { authenticateToken, requirePermission } = require('../middleware/auth');
+const { SUCCESS_MESSAGES, STATUS_CODES } = require('../config/constants');
 const router = express.Router();
-const generateToken = (userId) => {
-  return jwt.sign(
-    { userId },
-    process.env.JWT_SECRET,
-    { expiresIn: '7d' }
-  );
-}
+
+/**
+ * @route   POST /api/auth/register
+ * @desc    Register a new user
+ * @access  Public
+ */
 router.post('/register', async (req, res) => {
   try {
-    const { username, email, password } = req.body;
-    if (!username || !email || !password) {
-      return res.status(400).json({
-        success: false,
-        error: 'All fields are required'
-      });
-    }
-    const existingUser = await User.findOne({
-      $or: [{ email }, { username }]
-    });
+    // Sanitize and validate input
+    const sanitizedData = ValidationHelper.sanitizeInput(req.body);
+    const validation = ValidationHelper.validateRegistration(sanitizedData);
 
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        error: existingUser.email === email ? 'Email already registered' : 'Username already taken'
-      });
+    if (!validation.isValid) {
+      return ResponseHandler.validationError(res, 'Registration validation failed', validation.errors);
     }
-    const user = new User({
-      username,
-      email,
-      password
-    });
 
-    await user.save();
-    const token = generateToken(user._id);
-    user.isOnline = true;
-    user.lastSeen = new Date();
-    await user.save();
-    res.status(201).json({
-      success: true,
-      message: 'User registered successfully',
-      data: {
-        user: user.getPublicProfile(),
-        token
-      }
-    });
+    // Register user
+    const result = await AuthService.registerUser(sanitizedData);
+
+    return ResponseHandler.success(
+      res, 
+      STATUS_CODES.CREATED, 
+      SUCCESS_MESSAGES.USER.REGISTERED, 
+      result
+    );
+
   } catch (error) {
     console.error('Registration error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Registration failed',
-      details: error.message
-    });
+    
+    if (error.message.includes('already')) {
+      return ResponseHandler.conflict(res, error.message);
+    }
+    
+    return ResponseHandler.error(res, STATUS_CODES.INTERNAL_SERVER_ERROR, 'Registration failed', error.message);
   }
 });
+
+/**
+ * @route   POST /api/auth/login
+ * @desc    Authenticate user and return token
+ * @access  Public
+ */
 router.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        error: 'Email and password are required'
-      });
+    // Sanitize and validate input
+    const sanitizedData = ValidationHelper.sanitizeInput(req.body);
+    const validation = ValidationHelper.validateLogin(sanitizedData);
+
+    if (!validation.isValid) {
+      return ResponseHandler.validationError(res, 'Login validation failed', validation.errors);
     }
-    const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid credentials'
-      });
-    }
-    const isPasswordValid = await user.comparePassword(password);
-    if (!isPasswordValid) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid credentials'
-      });
-    }
-    const token = generateToken(user._id);
-    user.isOnline = true;
-    user.lastSeen = new Date();
-    await user.save();
-    res.json({
-      success: true,
-      message: 'Login successful',
-      data: {
-        user: user.getPublicProfile(),
-        token
-      }
-    });
+
+    // Authenticate user
+    const result = await AuthService.loginUser(sanitizedData.email, sanitizedData.password);
+
+    return ResponseHandler.success(
+      res, 
+      STATUS_CODES.OK, 
+      SUCCESS_MESSAGES.USER.LOGGED_IN, 
+      result
+    );
+
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Login failed',
-      details: error.message
-    });
+    
+    if (error.message === 'Invalid credentials') {
+      return ResponseHandler.unauthorized(res, error.message);
+    }
+    
+    return ResponseHandler.error(res, STATUS_CODES.INTERNAL_SERVER_ERROR, 'Login failed', error.message);
   }
 });
+
+/**
+ * @route   POST /api/auth/logout
+ * @desc    Logout user
+ * @access  Private
+ */
 router.post('/logout', authenticateToken, async (req, res) => {
   try {
-        req.user.isOnline = false;
-    req.user.lastSeen = new Date();
-    await req.user.save();
-    res.json({
-      success: true,
-      message: 'Logout successful'
-    });
+    await AuthService.logoutUser(req.user._id);
+
+    return ResponseHandler.success(
+      res, 
+      STATUS_CODES.OK, 
+      SUCCESS_MESSAGES.USER.LOGGED_OUT
+    );
+
   } catch (error) {
     console.error('Logout error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Logout failed',
-      details: error.message
-    });
+    return ResponseHandler.error(res, STATUS_CODES.INTERNAL_SERVER_ERROR, 'Logout failed', error.message);
   }
 });
-router.get('/profile', authenticateToken, async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      data: {
-        user: req.user.getPublicProfile()
-      }
-    });
-  } catch (error) {
-    console.error('Profile fetch error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch profile',
-      details: error.message
-    });
-  }
-});
-router.put('/profile', authenticateToken, requireOwnership(), async (req, res) => {
-  try {
-    const { username, email, profilePicture } = req.body;
-    const updates = {};
-    if (username && username !== req.user.username) {
-      const existingUser = await User.findOne({ username });
-      if (existingUser) {
-        return res.status(400).json({
-          success: false,
-          error: 'Username already taken'
-        });
-      }
-      updates.username = username;
-    }
-    if (email && email !== req.user.email) {
-      const existingUser = await User.findOne({ email });
-      if (existingUser) {
-        return res.status(400).json({
-          success: false,
-          error: 'Email already registered'
-        });
-      }
-      updates.email = email;
-    }
-    if (profilePicture !== undefined) {
-      updates.profilePicture = profilePicture;
-    }
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'No valid updates provided'
-      });
-    }
-    const updatedUser = await User.findByIdAndUpdate(
-      req.user._id,
-      updates,
-      { new: true, runValidators: true }
-    ).select('-password');
 
-    res.json({
-      success: true,
-      message: 'Profile updated successfully',
-      data: {
-        user: updatedUser.getPublicProfile()
-      }
-    });
-  } catch (error) {
-    console.error('Profile update error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Profile update failed',
-      details: error.message
-    });
-  }
-});
-router.put('/change-password', authenticateToken, requireOwnership(), async (req, res) => {
-  try {
-    const { currentPassword, newPassword } = req.body;
-    if (!currentPassword || !newPassword) {
-      return res.status(400).json({
-        success: false,
-        error: 'Current password and new password are required'
-      });
-    }
-    const user = await User.findById(req.user._id);
-    const isCurrentPasswordValid = await user.comparePassword(currentPassword);
-    if (!isCurrentPasswordValid) {
-      return res.status(401).json({
-        success: false,
-        error: 'Current password is incorrect'
-      });
-    }
-    user.password = newPassword;
-    await user.save();
-    res.json({
-      success: true,
-      message: 'Password changed successfully'
-    });
-  } catch (error) {
-    console.error('Password change error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Password change failed',
-      details: error.message
-    });
-  }
-});
-router.get('/stats', authenticateToken, async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id);
-    res.json({
-      success: true,
-      data: {
-        stats: {
-          rating: user.rating,
-          gamesPlayed: user.gamesPlayed,
-          gamesWon: user.gamesWon,
-          gamesDrawn: user.gamesDrawn,
-          gamesLost: user.gamesLost,
-          winRate: user.winRate,
-          totalScore: user.totalScore
-        }
-      }
-    });
-  } catch (error) {
-    console.error('Stats fetch error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch statistics',
-      details: error.message
-    });
-  }
-});
+/**
+ * @route   POST /api/auth/refresh
+ * @desc    Refresh access token
+ * @access  Private
+ */
 router.post('/refresh', authenticateToken, async (req, res) => {
   try {
-    const newToken = generateToken(req.user._id);
-    res.json({
-      success: true,
-      message: 'Token refreshed successfully',
-      data: {
-        token: newToken
-      }
-    });
+    // For now, generate new access token
+    // In a more advanced implementation, you'd use a refresh token
+    const result = await AuthService.refreshToken(req.user._id);
+
+    return ResponseHandler.success(
+      res, 
+      STATUS_CODES.OK, 
+      SUCCESS_MESSAGES.USER.TOKEN_REFRESHED, 
+      result
+    );
+
   } catch (error) {
     console.error('Token refresh error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Token refresh failed',
-      details: error.message
-    });
+    return ResponseHandler.error(res, STATUS_CODES.INTERNAL_SERVER_ERROR, 'Token refresh failed', error.message);
   }
 });
+
+/**
+ * @route   GET /api/auth/profile
+ * @desc    Get user profile
+ * @access  Private
+ */
+router.get('/profile', authenticateToken, async (req, res) => {
+  try {
+    const profile = await AuthService.getUserProfile(req.user._id);
+
+    return ResponseHandler.success(
+      res, 
+      STATUS_CODES.OK, 
+      'Profile retrieved successfully', 
+      { user: profile }
+    );
+
+  } catch (error) {
+    console.error('Profile fetch error:', error);
+    
+    if (error.message === 'User not found') {
+      return ResponseHandler.notFound(res, error.message);
+    }
+    
+    return ResponseHandler.error(res, STATUS_CODES.INTERNAL_SERVER_ERROR, 'Failed to fetch profile', error.message);
+  }
+});
+
+/**
+ * @route   PUT /api/auth/profile
+ * @desc    Update user profile
+ * @access  Private
+ */
+router.put('/profile', authenticateToken, requirePermission('user', 'edit_profile', async (req) => {
+  return { targetUser: req.user };
+}), async (req, res) => {
+  try {
+    // Sanitize and validate input
+    const sanitizedData = ValidationHelper.sanitizeInput(req.body);
+    const validation = ValidationHelper.validateProfileUpdate(sanitizedData);
+
+    if (!validation.isValid) {
+      return ResponseHandler.validationError(res, 'Profile update validation failed', validation.errors);
+    }
+
+    // Update profile
+    const updatedProfile = await AuthService.updateUserProfile(req.user._id, sanitizedData);
+
+    return ResponseHandler.success(
+      res, 
+      STATUS_CODES.OK, 
+      SUCCESS_MESSAGES.USER.PROFILE_UPDATED, 
+      { user: updatedProfile }
+    );
+
+  } catch (error) {
+    console.error('Profile update error:', error);
+    
+    if (error.message.includes('already')) {
+      return ResponseHandler.conflict(res, error.message);
+    }
+    
+    if (error.message === 'User not found') {
+      return ResponseHandler.notFound(res, error.message);
+    }
+    
+    return ResponseHandler.error(res, STATUS_CODES.INTERNAL_SERVER_ERROR, 'Profile update failed', error.message);
+  }
+});
+
+/**
+ * @route   PUT /api/auth/change-password
+ * @desc    Change user password
+ * @access  Private
+ */
+router.put('/change-password', authenticateToken, requirePermission('user', 'change_password', async (req) => {
+  return { targetUser: req.user };
+}), async (req, res) => {
+  try {
+    // Sanitize and validate input
+    const sanitizedData = ValidationHelper.sanitizeInput(req.body);
+    const validation = ValidationHelper.validatePasswordChange(sanitizedData);
+
+    if (!validation.isValid) {
+      return ResponseHandler.validationError(res, 'Password change validation failed', validation.errors);
+    }
+
+    // Change password
+    await AuthService.changePassword(
+      req.user._id, 
+      sanitizedData.currentPassword, 
+      sanitizedData.newPassword
+    );
+
+    return ResponseHandler.success(
+      res, 
+      STATUS_CODES.OK, 
+      SUCCESS_MESSAGES.USER.PASSWORD_CHANGED
+    );
+
+  } catch (error) {
+    console.error('Password change error:', error);
+    
+    if (error.message === 'Current password is incorrect') {
+      return ResponseHandler.unauthorized(res, error.message);
+    }
+    
+    if (error.message === 'User not found') {
+      return ResponseHandler.notFound(res, error.message);
+    }
+    
+    return ResponseHandler.error(res, STATUS_CODES.INTERNAL_SERVER_ERROR, 'Password change failed', error.message);
+  }
+});
+
+/**
+ * @route   GET /api/auth/stats
+ * @desc    Get user statistics
+ * @access  Private
+ */
+router.get('/stats', authenticateToken, requirePermission('user', 'view_stats', async (req) => {
+  return { targetUser: req.user };
+}), async (req, res) => {
+  try {
+    const stats = await AuthService.getUserStats(req.user._id);
+
+    return ResponseHandler.success(
+      res, 
+      STATUS_CODES.OK, 
+      'Statistics retrieved successfully', 
+      { stats }
+    );
+
+  } catch (error) {
+    console.error('Stats fetch error:', error);
+    
+    if (error.message === 'User not found') {
+      return ResponseHandler.notFound(res, error.message);
+    }
+    
+    return ResponseHandler.error(res, STATUS_CODES.INTERNAL_SERVER_ERROR, 'Failed to fetch statistics', error.message);
+  }
+});
+
 module.exports = router;
